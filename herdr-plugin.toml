@@ -1,0 +1,33 @@
+id = "herdr-pane-mover"
+name = "Herdr Pane Mover"
+version = "0.2.0"
+# Required by Herdr for local linking. Provisional until live compatibility is verified.
+min_herdr_version = "0.9.0"
+description = "Move a running pane with a minimal workspace, tab, and pane tree."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "scripts/install.sh"]
+
+[[actions]]
+id = "move"
+title = "Move pane (picker)"
+command = ["./bin/pane-mover", "move"]
+
+[[actions]]
+id = "new-tab"
+title = "Move pane to new tab"
+command = ["./bin/pane-mover", "new-tab"]
+
+[[actions]]
+id = "new-workspace"
+title = "Move pane to new workspace"
+command = ["./bin/pane-mover", "new-workspace"]
+
+[[panes]]
+id = "picker"
+title = "Move pane"
+command = ["./bin/pane-mover", "picker"]
+placement = "popup"
+width = 72
+height = 18
