@@ -21,7 +21,7 @@ CI runs these checks on macOS and Linux with read-only repository permissions. K
 
 ## Live compatibility
 
-Version 0.2.0 remains unverified. The manifest minimum of Herdr 0.9.0 is provisional. Before tagging, record the tested source commit, date, OS/architecture, Go version, Herdr version, and observations below. Test each advertised platform; record gaps explicitly and limit compatibility claims accordingly.
+Version 0.1.0 remains unverified. The manifest minimum of Herdr 0.9.0 is provisional. Before tagging, record the tested source commit, date, OS/architecture, Go version, Herdr version, and observations below. Test each advertised platform; record gaps explicitly and limit compatibility claims accordingly.
 
 - [ ] Move a running counter/process to a selected tab, exact pane, new tab, and new workspace. Confirm its PID/output survives, focus follows it, and Right/Below split at 50/50.
 - [ ] Exercise mouse and keyboard navigation, expansion, Back/Cancel, and layout at 72×18 and 40×12.

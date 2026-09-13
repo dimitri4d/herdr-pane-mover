@@ -26,19 +26,15 @@ Placement    (*) Right   ( ) Below
 Click a tab or pane to move.         Cancel
 ```
 
-**0.2.0 is an unpublished release candidate.** Live Herdr compatibility testing is still required; the manifest minimum of 0.9.0 is provisional. Use the source build below until a release is published.
-
-## Install a published version
-
-Once v0.2.0 has been tested and tagged:
+## Install
 
 ```sh
-herdr plugin install dimitri4d/herdr-pane-mover --ref v0.2.0
+herdr plugin install dimitri4d/herdr-pane-mover --ref main
 ```
 
 Installation builds the checked-out Go source into `bin/pane-mover`. It requires macOS or Linux, Git, and **Go 1.26.8 or newer** installed on your PATH. Go downloads pinned dependencies as needed and verifies them against `go.sum`; the installer does not download a compiler or prebuilt executable. Go is needed only when building or reinstalling.
 
-Use a trusted release tag, or a full commit SHA for an immutable source reference. Installing or linking a plugin runs ordinary code with your user permissions.
+The command above installs the current `main` branch. Use a full commit SHA for an immutable source reference, or a release tag when available. Installing or linking a plugin runs ordinary code with your user permissions.
 
 ## Bind actions
 

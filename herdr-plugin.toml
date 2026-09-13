@@ -1,6 +1,6 @@
 id = "herdr-pane-mover"
 name = "Herdr Pane Mover"
-version = "0.2.0"
+version = "0.1.0"
 # Required by Herdr for local linking. Provisional until live compatibility is verified.
 min_herdr_version = "0.9.0"
 description = "Move a running pane with a minimal workspace, tab, and pane tree."
