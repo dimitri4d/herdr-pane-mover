@@ -17,15 +17,21 @@ func fixture() Snapshot {
 		Workspaces: []Workspace{{"w1", "Work"}, {"w2", "Other"}},
 		Tabs:       []Tab{{"w1:t1", "w1", "Source"}, {"w1:t2", "w1", "Tools"}, {"w2:t1", "w2", "Remote"}},
 		Panes:      []Pane{{ID: "w1:p1", Workspace: "w1", Tab: "w1:t1", Terminal: "term1", Label: "Agent"}, {ID: "w1:p2", Workspace: "w1", Tab: "w1:t2", Terminal: "term2", Label: "Logs"}, {ID: "w1:p3", Workspace: "w1", Tab: "w1:t2", Terminal: "term3", Label: "Shell"}, {ID: "w2:p1", Workspace: "w2", Tab: "w2:t1", Terminal: "term4", Label: "Remote shell"}},
-		Layouts:    map[string]Layout{"w1:t1": {"w1", "w1:t1", "w1:p1", boolp(false)}, "w1:t2": {"w1", "w1:t2", "w1:p2", boolp(false)}, "w2:t1": {"w2", "w2:t1", "w2:p1", boolp(false)}},
+		Layouts: map[string]Layout{
+			"w1:t1": {Workspace: "w1", Tab: "w1:t1", Active: "w1:p1", Zoomed: boolp(false), Area: Rect{Width: 100, Height: 50}, Panes: []PaneRect{{"w1:p1", Rect{Width: 100, Height: 50}}}},
+			"w1:t2": {Workspace: "w1", Tab: "w1:t2", Active: "w1:p2", Zoomed: boolp(false), Area: Rect{Width: 100, Height: 50}, Panes: []PaneRect{{"w1:p2", Rect{Width: 50, Height: 50}}, {"w1:p3", Rect{X: 50, Width: 50, Height: 50}}}},
+			"w2:t1": {Workspace: "w2", Tab: "w2:t1", Active: "w2:p1", Zoomed: boolp(false), Area: Rect{Width: 100, Height: 50}, Panes: []PaneRect{{"w2:p1", Rect{Width: 100, Height: 50}}}},
+		},
 	}
 }
 
 type fake struct {
-	s       Snapshot
-	calls   [][]string
-	move    *MoveResult
-	failure error
+	s        Snapshot
+	calls    [][]string
+	move     *MoveResult
+	swap     *SwapResult
+	swapFail error
+	failure  error
 }
 
 func (f *fake) client() Client {
@@ -74,6 +80,15 @@ func (f *fake) client() Client {
 		case "pane move":
 			r.Type = "pane_move"
 			r.Move = f.move
+		case "pane swap":
+			if f.swapFail != nil {
+				return nil, []byte("swap refused"), f.swapFail
+			}
+			r.Type = "pane_swap"
+			r.Swap = f.swap
+			if r.Swap == nil {
+				r.Swap = &SwapResult{Changed: boolp(true), Focused: a[3]}
+			}
 		case "plugin pane":
 			r.Type = "ok"
 		default:
@@ -85,10 +100,12 @@ func (f *fake) client() Client {
 		return b, nil, nil
 	}}
 }
-func (f *fake) moves() [][]string {
+func (f *fake) moves() [][]string { return f.commands("move") }
+func (f *fake) swaps() [][]string { return f.commands("swap") }
+func (f *fake) commands(verb string) [][]string {
 	out := [][]string{}
 	for _, a := range f.calls {
-		if len(a) > 1 && a[0] == "pane" && a[1] == "move" {
+		if len(a) > 1 && a[0] == "pane" && a[1] == verb {
 			out = append(out, a)
 		}
 	}
@@ -117,7 +134,7 @@ func TestDestinationsAndExactTargets(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			a, e := moveArgs(src, d, "down")
+			a, e := moveArgs(src, d, Below)
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -136,7 +153,7 @@ func TestTabCaptureSurvivesFocusChange(t *testing.T) {
 	l.Active = "w1:p3"
 	s.Layouts[d.Tab] = l
 	f := &fake{s: s, move: successfulMove(src)}
-	if e := f.client().move(context.Background(), src, d, "right"); e != nil {
+	if e := f.client().move(context.Background(), src, d, Right); e != nil {
 		t.Fatal(e)
 	}
 	a := strings.Join(f.moves()[0], " ")
@@ -176,7 +193,7 @@ func TestRevalidationRefusesChangedState(t *testing.T) {
 				d, _ = s.destination("pane", src.ID)
 			}
 			f := &fake{s: s, move: successfulMove(src)}
-			if e := f.client().move(context.Background(), src, d, "right"); e == nil {
+			if e := f.client().move(context.Background(), src, d, Right); e == nil {
 				t.Fatal("move should fail")
 			}
 			if len(f.moves()) != 0 {
@@ -208,7 +225,7 @@ func TestMoveResponseValidation(t *testing.T) {
 			}
 			f := &fake{s: s, move: m}
 			d, _ := s.destination("new-workspace", "")
-			e := f.client().move(context.Background(), src, d, "right")
+			e := f.client().move(context.Background(), src, d, Right)
 			if (e == nil) != (scenario == "success") {
 				t.Fatalf("unexpected error: %v", e)
 			}
@@ -338,7 +355,7 @@ func TestUnzoomMove(t *testing.T) {
 			}
 			f := &fake{s: s, move: successfulMove(src)}
 			d := Destination{Kind: "tab", Workspace: "w1", Tab: "w1:t2"}
-			err := f.client().move(context.Background(), src, d, "right")
+			err := f.client().move(context.Background(), src, d, Right)
 			var zoom *zoomMoveError
 			if !errors.As(err, &zoom) || len(f.moves()) != 0 {
 				t.Fatalf("expected zoom recovery, got %v", err)
@@ -351,7 +368,7 @@ func TestUnzoomMove(t *testing.T) {
 			l := f.s.Layouts["w1:t2"]
 			l.Active = "w1:p3"
 			f.s.Layouts["w1:t2"] = l
-			if err := f.client().moveWithZoom(context.Background(), src, zoom.destination, "right", true); err != nil {
+			if err := f.client().moveWithZoom(context.Background(), src, zoom.destination, Right, true); err != nil {
 				t.Fatal(err)
 			}
 			if len(f.moves()) != 1 || !strings.Contains(strings.Join(f.moves()[0], " "), "--target-pane w1:p2") {
@@ -399,11 +416,127 @@ func TestUnzoomRecoveryRefusesChangesAndFailures(t *testing.T) {
 				}
 				return out, stderr, err
 			}}
-			if err := c.moveWithZoom(ctx, src, d, "right", true); err == nil {
+			if err := c.moveWithZoom(ctx, src, d, Right, true); err == nil {
 				t.Fatal("expected refusal")
 			}
 			if len(f.moves()) != 0 {
 				t.Fatal("unexpected move")
+			}
+		})
+	}
+}
+
+func TestPlacementSplitsAndSwaps(t *testing.T) {
+	for _, tt := range []struct {
+		placement Placement
+		split     string
+		swap      bool
+	}{{Right, "right", false}, {Below, "down", false}, {Left, "right", true}, {Above, "down", true}} {
+		t.Run(string(tt.placement), func(t *testing.T) {
+			s := fixture()
+			src := s.Panes[0]
+			d, _ := s.destination("pane", "w1:p3")
+			f := &fake{s: s, move: successfulMove(src)}
+			if e := f.client().move(context.Background(), src, d, tt.placement); e != nil {
+				t.Fatal(e)
+			}
+			if len(f.moves()) != 1 || !strings.Contains(strings.Join(f.moves()[0], " "), "--target-pane w1:p3 --split "+tt.split+" ") {
+				t.Fatal(f.moves())
+			}
+			// The swap uses the moved pane's new ID and the exact target.
+			want := [][]string{}
+			if tt.swap {
+				want = append(want, []string{"pane", "swap", "--source-pane", "w2:p9", "--target-pane", "w1:p3"})
+			}
+			if !reflect.DeepEqual(f.swaps(), want) {
+				t.Fatal(f.swaps())
+			}
+		})
+	}
+}
+func TestPlacementIgnoredForNewTabsAndWorkspaces(t *testing.T) {
+	for _, kind := range []string{"workspace", "new-workspace"} {
+		s := fixture()
+		src := s.Panes[0]
+		d, _ := s.destination(kind, "w2")
+		f := &fake{s: s, move: successfulMove(src)}
+		if e := f.client().move(context.Background(), src, d, Left); e != nil || len(f.swaps()) != 0 {
+			t.Fatal(kind, e, f.swaps())
+		}
+	}
+}
+func TestFailedPlacementSwapReportsLandingSide(t *testing.T) {
+	for _, scenario := range []string{"refused", "no change", "wrong focus"} {
+		t.Run(scenario, func(t *testing.T) {
+			s := fixture()
+			src := s.Panes[0]
+			d, _ := s.destination("pane", "w1:p3")
+			f := &fake{s: s, move: successfulMove(src)}
+			switch scenario {
+			case "refused":
+				f.swapFail = errors.New("exit 1")
+			case "no change":
+				f.swap = &SwapResult{Changed: boolp(false), Reason: "same_pane"}
+			case "wrong focus":
+				f.swap = &SwapResult{Changed: boolp(true), Focused: "w1:p3"}
+			}
+			err := f.client().move(context.Background(), src, d, Above)
+			var partial *partialPlacementError
+			if !errors.As(err, &partial) || !strings.Contains(err.Error(), "landed below the target instead of above it") {
+				t.Fatal(err)
+			}
+			if len(f.moves()) != 1 || len(f.swaps()) != 1 {
+				t.Fatal("move or swap retried")
+			}
+		})
+	}
+}
+func sameTabFixture() Snapshot {
+	s := fixture()
+	s.Panes = append(s.Panes, Pane{ID: "w1:p4", Workspace: "w1", Tab: "w1:t1", Terminal: "term5", Label: "Editor"})
+	l := s.Layouts["w1:t1"]
+	l.Panes = []PaneRect{{"w1:p1", Rect{Width: 50, Height: 50}}, {"w1:p4", Rect{X: 50, Width: 50, Height: 50}}}
+	s.Layouts["w1:t1"] = l
+	return s
+}
+func TestSameTabSwap(t *testing.T) {
+	for _, scenario := range []string{"swap", "zoomed", "other tab", "self", "target gone"} {
+		t.Run(scenario, func(t *testing.T) {
+			s := sameTabFixture()
+			src := s.Panes[0]
+			d, _ := s.destination("pane", "w1:p4")
+			d.Kind = "swap"
+			switch scenario {
+			case "zoomed":
+				l := s.Layouts[src.Tab]
+				l.Zoomed = boolp(true)
+				s.Layouts[src.Tab] = l
+			case "other tab":
+				d, _ = s.destination("pane", "w1:p3")
+				d.Kind = "swap"
+			case "self":
+				d, _ = s.destination("pane", src.ID)
+				d.Kind = "swap"
+			case "target gone":
+				s.Panes = s.Panes[:len(s.Panes)-1]
+			}
+			f := &fake{s: s}
+			err := f.client().move(context.Background(), src, d, Left)
+			ok := scenario == "swap" || scenario == "zoomed"
+			if (err == nil) != ok {
+				t.Fatal(err)
+			}
+			want := [][]string{}
+			if ok {
+				want = append(want, []string{"pane", "swap", "--source-pane", "w1:p1", "--target-pane", "w1:p4"})
+			}
+			if !reflect.DeepEqual(f.swaps(), want) || len(f.moves()) != 0 {
+				t.Fatal(f.calls)
+			}
+			for _, a := range f.calls {
+				if a[1] == "zoom" {
+					t.Fatal("swap unzoomed a tab")
+				}
 			}
 		})
 	}

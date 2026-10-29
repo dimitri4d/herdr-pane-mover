@@ -30,16 +30,33 @@ type Pane struct {
 	Label     string `json:"label"`
 	Title     string `json:"title"`
 }
+type Rect struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+type PaneRect struct {
+	ID   string `json:"pane_id"`
+	Rect Rect   `json:"rect"`
+}
 type Layout struct {
-	Workspace string `json:"workspace_id"`
-	Tab       string `json:"tab_id"`
-	Active    string `json:"focused_pane_id"`
-	Zoomed    *bool  `json:"zoomed"`
+	Workspace string     `json:"workspace_id"`
+	Tab       string     `json:"tab_id"`
+	Active    string     `json:"focused_pane_id"`
+	Zoomed    *bool      `json:"zoomed"`
+	Area      Rect       `json:"area"`
+	Panes     []PaneRect `json:"panes"`
 }
 type MoveResult struct {
 	Changed *bool  `json:"changed"`
 	Reason  string `json:"reason"`
 	Pane    Pane   `json:"pane"`
+	Focused string `json:"focused_pane_id"`
+}
+type SwapResult struct {
+	Changed *bool  `json:"changed"`
+	Reason  string `json:"reason"`
 	Focused string `json:"focused_pane_id"`
 }
 type Result struct {
@@ -50,6 +67,7 @@ type Result struct {
 	Pane       *Pane       `json:"pane"`
 	Layout     *Layout     `json:"layout"`
 	Move       *MoveResult `json:"move_result"`
+	Swap       *SwapResult `json:"swap"`
 }
 type runner func(context.Context, ...string) ([]byte, []byte, error)
 type Client struct{ run runner }
@@ -190,6 +208,50 @@ type Destination struct {
 	Target    Pane
 }
 
+// Placement is where a moved pane lands relative to its target pane.
+type Placement string
+
+const (
+	Left  Placement = "left"
+	Right Placement = "right"
+	Above Placement = "above"
+	Below Placement = "below"
+)
+
+// Herdr only splits right or down. Left and Above split the same way, then
+// swap the moved pane with its target.
+func (p Placement) split() (dir string, swap bool, err error) {
+	switch p {
+	case Right:
+		return "right", false, nil
+	case Below:
+		return "down", false, nil
+	case Left:
+		return "right", true, nil
+	case Above:
+		return "down", true, nil
+	}
+	return "", false, errors.New("invalid placement")
+}
+func (p Placement) opposite() Placement {
+	return map[Placement]Placement{Left: Right, Right: Left, Above: Below, Below: Above}[p]
+}
+
+// The move succeeded but the follow-up swap did not, so the pane sits on the
+// opposite side of its target. Nothing is rolled back.
+type partialPlacementError struct {
+	placement Placement
+	cause     error
+}
+
+func (e *partialPlacementError) Error() string {
+	return fmt.Sprintf("Moved, but landed %s the target instead of %s it: %v", sideName(e.placement.opposite()), sideName(e.placement), e.cause)
+}
+func (e *partialPlacementError) Unwrap() error { return e.cause }
+func sideName(p Placement) string {
+	return map[Placement]string{Left: "left of", Right: "right of", Above: "above", Below: "below"}[p]
+}
+
 func (s Snapshot) validateLocation(src Pane, d Destination) error {
 	p, ok := s.pane(src.ID)
 	if !ok || !samePane(p, src) {
@@ -208,8 +270,11 @@ func (s Snapshot) validateLocation(src Pane, d Destination) error {
 				return nil
 			}
 		}
-	case "tab", "pane":
-		if d.Tab == src.Tab {
+	case "tab", "pane", "swap":
+		if d.Kind == "swap" && (d.Tab != src.Tab || d.Target.ID == src.ID) {
+			return errors.New("swap target must be another pane in the current tab; Refresh and select again")
+		}
+		if d.Kind != "swap" && d.Tab == src.Tab {
 			return errors.New("current tab unavailable: Herdr does not support same-tab moves")
 		}
 		p, ok := s.pane(d.Target.ID)
@@ -236,13 +301,17 @@ func (s Snapshot) validate(src Pane, d Destination) error {
 	if err := s.validateLocation(src, d); err != nil {
 		return err
 	}
+	// Herdr swaps panes inside a zoomed tab, so only moves need unzooming.
+	if d.Kind == "swap" {
+		return nil
+	}
 	if *s.Layouts[src.Tab].Zoomed || ((d.Kind == "tab" || d.Kind == "pane") && *s.Layouts[d.Tab].Zoomed) {
 		return &zoomMoveError{destination: d}
 	}
 	return nil
 }
 
-func moveArgs(src Pane, d Destination, dir string) ([]string, error) {
+func moveArgs(src Pane, d Destination, placement Placement) ([]string, error) {
 	a := []string{"pane", "move", src.ID}
 	switch d.Kind {
 	case "workspace":
@@ -253,7 +322,8 @@ func moveArgs(src Pane, d Destination, dir string) ([]string, error) {
 	case "new-workspace":
 		a = append(a, "--new-workspace")
 	case "tab", "pane":
-		if d.Target.ID == "" || d.Tab == "" || (dir != "right" && dir != "down") {
+		dir, _, err := placement.split()
+		if d.Target.ID == "" || d.Tab == "" || err != nil {
 			return nil, errors.New("invalid split target")
 		}
 		a = append(a, "--tab", d.Tab, "--target-pane", d.Target.ID, "--split", dir, "--ratio", "0.5")
@@ -262,11 +332,11 @@ func moveArgs(src Pane, d Destination, dir string) ([]string, error) {
 	}
 	return append(a, "--focus"), nil
 }
-func (c Client) move(ctx context.Context, src Pane, d Destination, dir string) error {
-	return c.moveWithZoom(ctx, src, d, dir, false)
+func (c Client) move(ctx context.Context, src Pane, d Destination, placement Placement) error {
+	return c.moveWithZoom(ctx, src, d, placement, false)
 }
 
-func (c Client) moveWithZoom(ctx context.Context, src Pane, d Destination, dir string, unzoom bool) error {
+func (c Client) moveWithZoom(ctx context.Context, src Pane, d Destination, placement Placement, unzoom bool) error {
 	fresh := Snapshot{Layouts: map[string]Layout{}}
 	current, e := c.pane(ctx, "pane", "get", src.ID)
 	if e != nil {
@@ -284,7 +354,7 @@ func (c Client) moveWithZoom(ctx context.Context, src Pane, d Destination, dir s
 			return e
 		}
 	}
-	if d.Kind == "tab" || d.Kind == "pane" {
+	if d.Kind == "tab" || d.Kind == "pane" || d.Kind == "swap" {
 		target, err := c.pane(ctx, "pane", "get", d.Target.ID)
 		if err != nil {
 			return err
@@ -343,12 +413,15 @@ func (c Client) moveWithZoom(ctx context.Context, src Pane, d Destination, dir s
 		}
 		// Revalidate both panes and zoom states after all unzoom operations.
 		// This makes one move attempt and never restores zoom or retries it.
-		return c.move(ctx, src, d, dir)
+		return c.move(ctx, src, d, placement)
 	}
 	if e = fresh.validate(src, d); e != nil {
 		return e
 	}
-	args, e := moveArgs(src, d, dir)
+	if d.Kind == "swap" {
+		return c.swap(ctx, src.ID, d.Target.ID, "swap outcome uncertain; inspect the tab before trying again")
+	}
+	args, e := moveArgs(src, d, placement)
 	if e != nil {
 		return e
 	}
@@ -370,6 +443,29 @@ func (c Client) moveWithZoom(ctx context.Context, src Pane, d Destination, dir s
 	}
 	if !validPane(r.Move.Pane) || r.Move.Pane.Terminal != src.Terminal || r.Move.Focused != r.Move.Pane.ID {
 		return errors.New("move reported changed but pane/focus confirmation is incomplete; inspect Herdr before trying again")
+	}
+	if _, swap, _ := placement.split(); swap && (d.Kind == "tab" || d.Kind == "pane") {
+		if e := c.swap(ctx, r.Move.Pane.ID, d.Target.ID, "swap outcome uncertain"); e != nil {
+			return &partialPlacementError{placement: placement, cause: e}
+		}
+	}
+	return nil
+}
+
+// swap exchanges two panes' positions; processes and the split shape are kept.
+func (c Client) swap(ctx context.Context, source, target, uncertain string) error {
+	r, e := c.call(ctx, "pane", "swap", "--source-pane", source, "--target-pane", target)
+	if e != nil {
+		return fmt.Errorf("%s: %w", uncertain, e)
+	}
+	if r.Type != "pane_swap" || r.Swap == nil || r.Swap.Changed == nil {
+		return errors.New("swap response incomplete; inspect the tab before trying again")
+	}
+	if !*r.Swap.Changed {
+		return fmt.Errorf("no swap: %s", name(r.Swap.Reason, "changed: false"))
+	}
+	if r.Swap.Focused != source {
+		return errors.New("swap reported changed but focus confirmation is incomplete; inspect Herdr before trying again")
 	}
 	return nil
 }

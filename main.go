@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -50,5 +50,5 @@ func performAction(ctx context.Context, c Client, action string) error {
 	if action == "new-tab" {
 		d = Destination{Kind: "workspace", Workspace: src.Workspace}
 	}
-	return c.move(ctx, src, d, "right")
+	return c.move(ctx, src, d, Right)
 }

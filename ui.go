@@ -10,27 +10,39 @@ import (
 )
 
 type picker struct {
-	retry                                     *Destination
-	unzoom                                    *tview.Button
-	c                                         Client
-	app                                       *tview.Application
-	ctx                                       context.Context
-	cancel                                    context.CancelFunc
-	launch                                    func(func())
-	dispatch                                  func(func())
-	sourceID                                  string
-	src                                       Pane
-	snap                                      Snapshot
-	mode, direction                           string
-	savedRow                                  int
-	expanded                                  map[string]bool
-	rows                                      []choice
-	pending, failed                           bool
-	header, status, divider                   *tview.TextView
-	list                                      *tview.Table
-	right, below, back, refresh, cancelButton *tview.Button
-	root, toolbar, footer                     *tview.Flex
+	retry                       *Destination
+	unzoom                      *tview.Button
+	c                           Client
+	app                         *tview.Application
+	ctx                         context.Context
+	cancel                      context.CancelFunc
+	launch                      func(func())
+	dispatch                    func(func())
+	sourceID                    string
+	src                         Pane
+	snap                        Snapshot
+	mode                        string
+	placement                   Placement
+	placeButtons                map[Placement]*tview.Button
+	savedRow                    int
+	expanded                    map[string]bool
+	rows                        []choice
+	pending, failed, mapVisible bool
+	header, status, divider     *tview.TextView
+	list                        *tview.Table
+	mmap                        *minimap
+	layouts                     map[string]*Layout
+	layoutFailed, layoutLoading map[string]bool
+	back, refresh, cancelButton *tview.Button
+	root, body, toolbar, footer *tview.Flex
 }
+
+// Right and Below come first: they need one Herdr call and fit narrow popups.
+var placementOrder = []Placement{Right, Below, Left, Above}
+var placementLabels = map[Placement]string{Right: "Right", Below: "Below", Left: "Left", Above: "Above"}
+
+// The minimap only appears when the popup is wide enough to keep the tree readable.
+const minimapMinWidth = 90
 
 func textView() *tview.TextView {
 	v := tview.NewTextView().SetDynamicColors(false).SetTextColor(tcell.ColorDefault)
@@ -46,7 +58,7 @@ func button(label string, fn func()) *tview.Button {
 func spacer() *tview.Box { return tview.NewBox().SetBackgroundColor(tcell.ColorDefault) }
 func newPicker(c Client, id string) *picker {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &picker{c: c, sourceID: id, ctx: ctx, cancel: cancel, app: tview.NewApplication(), mode: "tree", direction: "right", expanded: map[string]bool{}}
+	p := &picker{c: c, sourceID: id, ctx: ctx, cancel: cancel, app: tview.NewApplication(), mode: "tree", placement: Right, expanded: map[string]bool{}, placeButtons: map[Placement]*tview.Button{}}
 	p.launch = func(fn func()) { go fn() }
 	p.dispatch = func(fn func()) { p.app.QueueUpdateDraw(fn) }
 	p.header = textView().SetWrap(false)
@@ -54,27 +66,30 @@ func newPicker(c Client, id string) *picker {
 	p.divider = textView().SetWrap(false)
 	p.list = tview.NewTable().SetSelectable(true, false).SetSelectedStyle(tcell.StyleDefault.Bold(true).Underline(true))
 	p.list.SetBackgroundColor(tcell.ColorDefault)
-	p.right = button("(*) Right", func() { p.setDirection("right") })
-	p.below = button("( ) Below", func() { p.setDirection("down") })
+	for _, pl := range placementOrder {
+		p.placeButtons[pl] = button("", func() { p.setPlacement(pl) })
+	}
+	p.mmap = newMinimap()
+	p.mmap.SetBorderPadding(0, 0, 2, 0)
+	p.mmap.pick = p.pickFromMap
+	p.setPlacement(Right)
+	p.clearLayouts()
 	p.back = button("Back", p.goBack)
 	p.refresh = button("Refresh", p.reload)
 	p.unzoom = button("Unzoom & move", p.retryUnzoom)
 	p.cancelButton = button("Cancel", p.stop)
 	p.toolbar = flex()
 	p.footer = flex()
-	p.root = flex().SetDirection(tview.FlexRow).AddItem(p.header, 2, 0, false).AddItem(spacer(), 1, 0, false).AddItem(p.list, 0, 1, true).AddItem(p.toolbar, 1, 0, false).AddItem(spacer(), 1, 0, false).AddItem(p.divider, 1, 0, false).AddItem(p.footer, 1, 0, false)
+	p.body = flex().AddItem(p.list, 0, 1, true).AddItem(p.mmap, 0, 0, false)
+	p.root = flex().SetDirection(tview.FlexRow).AddItem(p.header, 2, 0, false).AddItem(spacer(), 1, 0, false).AddItem(p.body, 0, 1, true).AddItem(p.toolbar, 1, 0, false).AddItem(spacer(), 1, 0, false).AddItem(p.divider, 1, 0, false).AddItem(p.footer, 1, 0, false)
 	p.list.SetSelectedFunc(func(int, int) { p.activate() })
 	p.list.SetSelectionChangedFunc(func(int, int) {
 		p.highlightSelection()
 		if p.pending || p.failed {
 			return
 		}
-		c, ok := p.selected()
-		if ok && c.disabled {
-			p.status.SetText("Current tab: unavailable")
-		} else {
-			p.status.SetText("Click a tab or pane to move.")
-		}
+		p.updateMap()
+		p.status.SetText(p.selectionHint())
 	})
 	p.list.SetMouseCapture(func(a tview.MouseAction, e *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
 		x, y := e.Position()
@@ -126,7 +141,10 @@ func newPicker(c Client, id string) *picker {
 			} else if p.mode == "workspaces" {
 				items = append(items, p.back, p.cancelButton)
 			} else {
-				items = append(items, p.right, p.below, p.cancelButton)
+				for _, pl := range placementOrder {
+					items = append(items, p.placeButtons[pl])
+				}
+				items = append(items, p.cancelButton)
 			}
 			i := 0
 			for j, v := range items {
@@ -199,6 +217,15 @@ func newPicker(c Client, id string) *picker {
 	p.app.SetBeforeDrawFunc(func(s tcell.Screen) bool {
 		w, _ := s.Size()
 		p.divider.SetText(strings.Repeat("─", max(0, w)))
+		visible, width := w >= minimapMinWidth, 0
+		if visible {
+			width = w * 2 / 5
+		}
+		p.body.ResizeItem(p.mmap, width, 0)
+		if visible != p.mapVisible {
+			p.mapVisible = visible
+			p.updateMap()
+		}
 		return false
 	})
 	p.app.SetRoot(p.root, true).EnableMouse(true).SetFocus(p.list)
@@ -218,7 +245,10 @@ func (p *picker) controls() {
 	p.footer.Clear()
 	p.footer.SetDirection(tview.FlexColumn)
 	p.unzoom.SetDisabled(p.pending)
-	for _, b := range []*tview.Button{p.right, p.below, p.back, p.refresh} {
+	for _, b := range []*tview.Button{p.back, p.refresh} {
+		b.SetDisabled(p.pending || p.failed)
+	}
+	for _, b := range p.placeButtons {
 		b.SetDisabled(p.pending || p.failed)
 	}
 	if p.failed {
@@ -235,7 +265,10 @@ func (p *picker) controls() {
 	}
 	p.root.ResizeItem(p.footer, 1, 0)
 	if p.mode == "tree" {
-		p.toolbar.AddItem(textView().SetText("Placement"), 11, 0, false).AddItem(p.right, 12, 0, false).AddItem(p.below, 12, 0, false)
+		p.toolbar.AddItem(textView().SetText("Placement"), 11, 0, false)
+		for _, pl := range placementOrder {
+			p.toolbar.AddItem(p.placeButtons[pl], len(placementLabels[pl])+6, 0, false)
+		}
 	} else {
 		p.toolbar.AddItem(p.back, 8, 0, false)
 	}
@@ -254,8 +287,8 @@ func (p *picker) render(index int) {
 	if len(p.rows) == 0 {
 		p.list.SetCell(0, 0, tview.NewTableCell("No destinations available").SetStyle(tcell.StyleDefault).SetSelectable(false))
 	}
-	p.status.SetText("Click a tab or pane to move.")
 	p.list.Select(max(0, min(index, len(p.rows)-1)), 0)
+	p.status.SetText(p.selectionHint())
 	p.header.SetText("Move pane\nFrom " + p.snap.contextName(p.src))
 	if p.mode == "workspaces" {
 		p.header.SetText("New tab in…\nChoose a workspace")
@@ -317,6 +350,7 @@ func (p *picker) showError(err error) {
 		p.retry = &d
 	}
 	p.controls()
+	p.mmap.show(nil, "")
 	p.status.SetText(clean(err.Error()))
 	if p.retry != nil {
 		p.status.SetText("Source or destination tab is zoomed. Unzoom & move leaves affected tabs unzoomed, even if the move fails.")
@@ -332,6 +366,7 @@ func (p *picker) reload() {
 		return
 	}
 	p.retry = nil
+	p.clearLayouts()
 	p.busy(true)
 	p.status.SetText("Loading destinations…")
 	p.launch(func() {
@@ -354,18 +389,20 @@ func (p *picker) reload() {
 		})
 	})
 }
-func (p *picker) setDirection(dir string) {
+func (p *picker) setPlacement(pl Placement) {
 	if p.pending || p.failed {
 		return
 	}
-	p.direction = dir
-	p.right.SetLabel("( ) Right")
-	p.below.SetLabel("( ) Below")
-	if dir == "right" {
-		p.right.SetLabel("(*) Right")
-	} else {
-		p.below.SetLabel("(*) Below")
+	p.placement = pl
+	for k, b := range p.placeButtons {
+		mark := "( ) "
+		if k == pl {
+			mark = "(*) "
+		}
+		b.SetLabel(mark + placementLabels[k])
 	}
+	p.mmap.marker = pl
+	p.status.SetText(p.selectionHint())
 }
 func (p *picker) chooseWorkspace() {
 	if p.pending || p.failed {
@@ -402,7 +439,7 @@ func (p *picker) activate() {
 		return
 	}
 	if c.disabled {
-		p.status.SetText("Current tab: unavailable")
+		p.status.SetText(p.selectionHint())
 		return
 	}
 	p.submit(c.dest)
@@ -421,11 +458,14 @@ func (p *picker) submitMove(d Destination, unzoom bool) {
 	if p.pending || p.failed {
 		return
 	}
-	src, dir := p.src, p.direction
+	src, placement := p.src, p.placement
 	p.busy(true)
 	p.status.SetText("Moving…")
+	if d.Kind == "swap" {
+		p.status.SetText("Swapping…")
+	}
 	p.launch(func() {
-		e := p.c.moveWithZoom(p.ctx, src, d, dir, unzoom)
+		e := p.c.moveWithZoom(p.ctx, src, d, placement, unzoom)
 		if p.ctx.Err() != nil {
 			return
 		}
@@ -478,4 +518,120 @@ func (p *picker) highlightSelection() {
 	for i, c := range p.rows {
 		p.list.GetCell(i, 0).SetText(tview.Escape(treeRowText(c, i == row)))
 	}
+}
+
+func (p *picker) selectionHint() string {
+	c, ok := p.selected()
+	switch {
+	case !ok || p.mode != "tree":
+		return "Click a tab or pane to move."
+	case c.disabled && c.dest.Kind == "tab":
+		return "Current tab: choose a pane to swap with."
+	case c.disabled:
+		return "This is the pane being moved."
+	case c.dest.Kind == "swap":
+		return "Click to swap places with " + c.label + "."
+	case c.dest.Kind == "pane":
+		return "Click to move " + sideName(p.placement) + " " + c.label + "."
+	case c.dest.Kind == "tab":
+		return "Click to move " + sideName(p.placement) + " its focused pane."
+	}
+	return "Click a tab or pane to move."
+}
+
+func (p *picker) clearLayouts() {
+	p.layouts = map[string]*Layout{}
+	p.layoutFailed = map[string]bool{}
+	p.layoutLoading = map[string]bool{}
+}
+
+// updateMap shows the highlighted tab. Its layout is read once per Refresh;
+// moves still revalidate everything at activation.
+func (p *picker) updateMap() {
+	c, ok := p.selected()
+	tab := c.dest.Tab
+	if !p.mapVisible || !ok || p.mode != "tree" || tab == "" {
+		p.mmap.show(nil, "Highlight a tab to preview it.")
+		return
+	}
+	// Swaps keep the split shape, so only moves show a landing side.
+	p.mmap.source, p.mmap.target, p.mmap.showSide = p.src.ID, c.dest.Target.ID, tab != p.src.Tab
+	p.mmap.title = c.label
+	if c.dest.Kind != "tab" {
+		for _, r := range p.rows {
+			if r.dest.Kind == "tab" && r.dest.Tab == tab {
+				p.mmap.title = r.label
+			}
+		}
+	}
+	p.mmap.labels = map[string]string{}
+	for _, pane := range p.snap.Panes {
+		if pane.Tab == tab {
+			p.mmap.labels[pane.ID] = paneLabel(pane)
+		}
+	}
+	if l := p.layouts[tab]; l != nil {
+		if c.dest.Kind == "tab" && tab != p.src.Tab {
+			p.mmap.target = l.Active
+		}
+		p.mmap.show(l, "")
+		return
+	}
+	if p.layoutFailed[tab] {
+		p.mmap.show(nil, "Preview unavailable.")
+		return
+	}
+	p.mmap.show(nil, "Loading preview…")
+	var any Pane
+	for _, pane := range p.snap.Panes {
+		if pane.Tab == tab {
+			any = pane
+			break
+		}
+	}
+	if any.ID == "" || p.layoutLoading[tab] {
+		return
+	}
+	p.layoutLoading[tab] = true
+	p.launch(func() {
+		l, e := p.c.layout(p.ctx, any)
+		if p.ctx.Err() != nil {
+			return
+		}
+		p.dispatch(func() {
+			delete(p.layoutLoading, tab)
+			if e != nil {
+				p.layoutFailed[tab] = true
+			} else {
+				p.layouts[tab] = &l
+			}
+			if !p.pending && !p.failed {
+				p.updateMap()
+			}
+		})
+	})
+}
+
+// pickFromMap moves beside, or swaps with, a pane clicked in the minimap.
+func (p *picker) pickFromMap(id string, side Placement, edge bool) {
+	if p.pending || p.failed || p.mode != "tree" {
+		return
+	}
+	target, ok := p.snap.pane(id)
+	if !ok {
+		p.status.SetText("That pane is not in the tree yet. Refresh and select again.")
+		return
+	}
+	if id == p.src.ID {
+		p.status.SetText("This is the pane being moved.")
+		return
+	}
+	if target.Tab == p.src.Tab {
+		p.submit(Destination{Kind: "swap", Workspace: target.Workspace, Tab: target.Tab, Target: target})
+		return
+	}
+	if edge {
+		p.setPlacement(side)
+	}
+	p.submit(Destination{Kind: "pane", Workspace: target.Workspace, Tab: target.Tab, Target: target})
 }

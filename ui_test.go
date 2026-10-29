@@ -62,7 +62,7 @@ func TestTreeExpansionAndCurrentTab(t *testing.T) {
 		t.Fatal("current tab moved")
 	}
 	key(p, tcell.KeyRight)
-	r = selectChoice(t, p, "pane", "w1:p1")
+	r = selectChoice(t, p, "swap", "w1:p1")
 	if !p.rows[r].disabled {
 		t.Fatal("current pane enabled")
 	}
@@ -137,9 +137,9 @@ func TestPlacementAndCreation(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			p, f := setupPicker(t)
 			drawPicker(t, p, 72, 18)
-			x, y, _, _ := p.below.GetRect()
+			x, y, _, _ := p.placeButtons[Below].GetRect()
 			click(p, x+3, y)
-			if p.direction != "down" {
+			if p.placement != Below {
 				t.Fatal("Below click did not select")
 			}
 			r := selectChoice(t, p, kind, "")
@@ -244,9 +244,9 @@ func TestMouseControlsOutsideLongTree(t *testing.T) {
 	}
 	p.render(0)
 	drawPicker(t, p, 40, 12)
-	x, y, _, _ := p.below.GetRect()
+	x, y, _, _ := p.placeButtons[Below].GetRect()
 	click(p, x+3, y)
-	if len(f.calls) != 0 || p.direction != "down" {
+	if len(f.calls) != 0 || p.placement != Below {
 		t.Fatal("toolbar click activated offscreen row")
 	}
 	p.busy(true)
@@ -366,7 +366,7 @@ func TestKeyboardSelectionIsVisibleAndControlsDoNotTrapArrows(t *testing.T) {
 	if !strings.Contains(screenText(screen), "> ▾ Work") {
 		t.Fatal("initial workspace has no visible selection")
 	}
-	p.app.SetFocus(p.below)
+	p.app.SetFocus(p.placeButtons[Below])
 	key(p, tcell.KeyDown)
 	if !p.list.HasFocus() {
 		t.Fatal("Down stayed trapped in placement controls")
@@ -622,5 +622,137 @@ func TestCreationSeparatorIsNotSelectable(t *testing.T) {
 	after, _ = p.list.GetSelection()
 	if after != row+1 {
 		t.Fatal("Down did not skip separator")
+	}
+}
+
+func (f *fake) layoutReads() int { return len(f.commands("layout")) }
+func TestCurrentTabPanesSwap(t *testing.T) {
+	s := sameTabFixture()
+	f := &fake{s: sameTabFixture()}
+	p := newPicker(f.client(), s.Panes[0].ID)
+	p.launch = func(fn func()) { fn() }
+	p.dispatch = func(fn func()) { fn() }
+	t.Cleanup(p.cancel)
+	p.applySnapshot(s, s.Panes[0])
+	p.expanded["tab:w1:t1"] = true
+	p.render(0)
+	selectChoice(t, p, "swap", "w1:p4")
+	if !strings.Contains(p.status.GetText(false), "swap places with Editor") {
+		t.Fatal(p.status.GetText(false))
+	}
+	key(p, tcell.KeyEnter)
+	if len(f.swaps()) != 1 || len(f.moves()) != 0 {
+		t.Fatal(f.calls)
+	}
+}
+func TestFourPlacementButtons(t *testing.T) {
+	p, f := setupPicker(t)
+	screen := drawPicker(t, p, 100, 24)
+	for _, label := range []string{"(*) Right", "( ) Below", "( ) Left", "( ) Above"} {
+		if !strings.Contains(screenText(screen), label) {
+			t.Fatalf("missing %s\n%s", label, screenText(screen))
+		}
+	}
+	x, y, _, _ := p.placeButtons[Above].GetRect()
+	click(p, x+3, y)
+	if p.placement != Above {
+		t.Fatal("Above click did not select")
+	}
+	selectChoice(t, p, "tab", "w1:t2")
+	key(p, tcell.KeyRight)
+	selectChoice(t, p, "pane", "w1:p3")
+	key(p, tcell.KeyEnter)
+	if len(f.moves()) != 1 || len(f.swaps()) != 1 || !strings.Contains(strings.Join(f.moves()[0], " "), "--split down") {
+		t.Fatal(f.calls)
+	}
+}
+func TestMinimapHiddenWhenNarrow(t *testing.T) {
+	for _, size := range [][2]int{{72, 18}, {40, 12}} {
+		p, f := setupPicker(t)
+		drawPicker(t, p, size[0], size[1])
+		selectChoice(t, p, "tab", "w1:t2")
+		drawPicker(t, p, size[0], size[1])
+		if _, _, w, _ := p.mmap.GetRect(); w != 0 || f.layoutReads() != 0 {
+			t.Fatalf("%v: minimap visible or read layout", size)
+		}
+	}
+}
+func minimapPoint(t *testing.T, p *picker, id string, side Placement) (int, int) {
+	t.Helper()
+	for _, r := range p.mmap.layout.Panes {
+		if r.ID != id {
+			continue
+		}
+		x0, y0, x1, y1 := p.mmap.box(r.Rect)
+		switch side {
+		case Left:
+			return x0, (y0 + y1) / 2
+		case Right:
+			return x1, (y0 + y1) / 2
+		case Above:
+			return (x0 + x1) / 2, y0
+		case Below:
+			return (x0 + x1) / 2, y1
+		}
+		return (x0 + x1) / 2, (y0 + y1) / 2
+	}
+	t.Fatalf("minimap missing %s", id)
+	return 0, 0
+}
+func TestMinimapPreviewAndClickToPlace(t *testing.T) {
+	for _, tt := range []struct {
+		side      Placement
+		split     string
+		swap      bool
+		placement Placement
+	}{{Left, "right", true, Left}, {Below, "down", false, Below}, {"", "right", false, Right}} {
+		t.Run("edge "+string(tt.side), func(t *testing.T) {
+			p, f := setupPicker(t)
+			selectChoice(t, p, "tab", "w1:t2")
+			screen := drawPicker(t, p, 100, 24)
+			screen = drawPicker(t, p, 100, 24)
+			text := screenText(screen)
+			if f.layoutReads() != 1 || !strings.Contains(text, "Logs") || !strings.Contains(text, "Shell") || !strings.Contains(text, "▶") {
+				t.Fatalf("preview missing\n%s", text)
+			}
+			selectChoice(t, p, "branch", "w1")
+			selectChoice(t, p, "tab", "w1:t2")
+			if f.layoutReads() != 1 {
+				t.Fatal("cached layout read again")
+			}
+			x, y := minimapPoint(t, p, "w1:p3", tt.side)
+			click(p, x, y)
+			if p.placement != tt.placement || len(f.moves()) != 1 || len(f.swaps()) != map[bool]int{true: 1}[tt.swap] {
+				t.Fatal(p.placement, f.calls)
+			}
+			if a := strings.Join(f.moves()[0], " "); !strings.Contains(a, "--target-pane w1:p3 --split "+tt.split) {
+				t.Fatal(a)
+			}
+		})
+	}
+}
+func TestMinimapSourceAndSameTab(t *testing.T) {
+	s := sameTabFixture()
+	f := &fake{s: sameTabFixture()}
+	p := newPicker(f.client(), s.Panes[0].ID)
+	p.launch = func(fn func()) { fn() }
+	p.dispatch = func(fn func()) { fn() }
+	t.Cleanup(p.cancel)
+	p.applySnapshot(s, s.Panes[0])
+	selectChoice(t, p, "tab", "w1:t1")
+	drawPicker(t, p, 100, 24)
+	screen := drawPicker(t, p, 100, 24)
+	if !strings.Contains(screenText(screen), "(moving)") {
+		t.Fatalf("source not marked\n%s", screenText(screen))
+	}
+	x, y := minimapPoint(t, p, "w1:p1", "")
+	click(p, x, y)
+	if len(f.swaps())+len(f.moves()) != 0 || !strings.Contains(p.status.GetText(false), "being moved") {
+		t.Fatal("source click acted")
+	}
+	x, y = minimapPoint(t, p, "w1:p4", Left)
+	click(p, x, y)
+	if len(f.swaps()) != 1 || len(f.moves()) != 0 || p.placement != Right {
+		t.Fatal("same-tab click should swap without changing placement", f.calls)
 	}
 }

@@ -12,6 +12,6 @@ assert m['build'] == [{'command': ['sh', 'scripts/install.sh']}]
 assert {a['id'] for a in m['actions']} == {'move', 'new-tab', 'new-workspace'}
 for a in m['actions']:
     assert a['command'] == ['./bin/pane-mover', a['id']]
-assert m['panes'] == [dict(id='picker', title='Move pane', command=['./bin/pane-mover', 'picker'], placement='popup', width=72, height=18)]
+assert m['panes'] == [dict(id='picker', title='Move pane', command=['./bin/pane-mover', 'picker'], placement='popup', width=100, height=24)]
 assert f'const version = "{version}"' in (root / 'main.go').read_text(), 'executable/manifest version mismatch'
 print('Manifest and executable version validated')

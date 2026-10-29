@@ -40,7 +40,7 @@ func uniqueChoices(items []choice) []choice {
 	for i, c := range items {
 		if counts[c.label] > 1 {
 			id := c.dest.Tab
-			if c.dest.Kind == "pane" {
+			if c.dest.Kind == "pane" || c.dest.Kind == "swap" {
 				id = c.dest.Target.ID
 			}
 			if c.dest.Kind == "branch" || c.dest.Kind == "workspace" {
@@ -93,7 +93,12 @@ func treeChoices(s Snapshot, src Pane, mode string, expanded map[string]bool) []
 				if p.Tab != t.dest.Tab {
 					continue
 				}
-				panes = append(panes, choice{label: paneLabel(p), dest: Destination{Kind: "pane", Workspace: p.Workspace, Tab: p.Tab, Target: p}, depth: 2, disabled: t.disabled})
+				// Herdr cannot move within a tab, but panes there can swap with the source.
+				kind := "pane"
+				if t.disabled {
+					kind = "swap"
+				}
+				panes = append(panes, choice{label: paneLabel(p), dest: Destination{Kind: kind, Workspace: p.Workspace, Tab: p.Tab, Target: p}, depth: 2, disabled: p.ID == src.ID})
 			}
 			out = append(out, uniqueChoices(panes)...)
 		}
